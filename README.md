@@ -11,10 +11,10 @@ would have seen. The last section matters most to me.
 
 | Box | Tier | OS | Writeup |
 |---|---|---|---|
+| Vaccine | 2 | Linux | [starting-point/vaccine.md](starting-point/vaccine.md) |
 | Three | 1 | Linux | [starting-point/three.md](starting-point/three.md) |
 
-More will land here as I finish them. Vaccine is written but stays local until
-I can describe the chain accurately rather than approximately.
+More will land here as I finish them.
 
 ## Why the writeups stop where they do
 
