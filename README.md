@@ -25,4 +25,4 @@ solving it, not reading someone else's route through it.
 ## Contact
 
 - Hack The Box: [@TheGhostTerminal](https://profile.hackthebox.com/profile/01a1394e-a617-70b7-a1a2-49f15bd283c1)
-- GitHub: [@escanor155](https://github.com/escanor155)
+- GitHub: [@the-ghostterminal](https://github.com/the-ghostterminal)
